@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleContexts #-}
 module Parallel (bitonicPar, mergePar, hybridPar, quickPar) where
 import           Control.DeepSeq             (force)
 import           Control.Monad               (when)
@@ -12,6 +13,7 @@ import qualified Data.Vector.Mutable         as M
 import qualified Data.Vector.Split           as S
 import           Sequential                  (quickSeq)
 import           Utils                       (fillBitonic)
+import qualified Control.Monad.State.Lazy    as S
 
 bitonicPar :: (NFData a, Ord a) => a -> V.Vector a -> IO (V.Vector a)
 bitonicPar = (bitonic .) . fillBitonic
@@ -116,7 +118,7 @@ merge x = runEval (merge' (0::Integer) x)
        | n > 1 = do
             a' <- merge' (l+1) a >>= if l < 15 then rpar else rseq
             b' <- merge' (l+1) b >>= if l < 15 then rpar else rseq
-            if l < 1 then merge2Par a' b' else return $ merge2 a' b'
+            if l < 1 then computeExchange a' b' else return $ merge2 a' b'
         | otherwise = return $ v!0
         where
         n = V.length v
@@ -150,30 +152,29 @@ merge2 a b = V.create $ do
                     go a' b' i (j+1) v
                 | otherwise = return ()
 
-merge2Par :: (NFData a, Ord a) => V.Vector a -> V.Vector a -> Eval (V.Vector a)
-merge2Par a b = do
-    l <- rpar (force lower)
-    u <- rpar (force upper)
-    return (l V.++ u)
+
+computeExchange :: (NFData a, Ord a) => V.Vector a -> V.Vector a -> Eval (V.Vector a)
+computeExchange a b = (`fmap` evalUpper) . (V.++) =<< evalLower 
     where
-        n = V.length a + V.length b
-        h = n `div` 2
-        third (_,_,x) = x
-        lower = third <$> V.postscanl' accumLower (0,0,undefined) (V.enumFromN (0::Integer) h)
-        accumLower (i, j, _) _
-            | i < V.length a && j < V.length b =
-                if a!i <= b!j then
-                    (i+1, j, a!i)
-                else
-                    (i, j+1, b!j)
-            | i < V.length a = (i+1, j, a!i)
-            | otherwise = (i, j+1, b!j)
-        upper = V.reverse $ third <$> V.postscanl' accumUpper (V.length a - 1,V.length b - 1,undefined) (V.enumFromN (0::Integer) (n-h))
-        accumUpper (i, j, _) _
-            | i > 0 && j > 0 =
-                if a!i >= b!j then
-                    (i-1, j, a!i)
-                else
-                    (i, j-1, b!j)
-            | i > 0 = (i-1, j, a!i)
-            | otherwise = (i, j-1, b!j)
+    evalLower = fpar $ lower 
+    evalUpper = fpar $ upper 
+    lower = pickAll (<=) a b (V.enumFromN (0::Int) n2) 
+    upper = V.reverse $ pickAll (>=) (V.reverse a) (V.reverse b) (V.enumFromN (0::Int) (n-n2))
+    pickAll f x y s = S.evalState (V.sequence $ (const $ pick f x y) <$> s) (0::Int,0::Int)
+    pick f x y = S.get >>= pick' f x y
+    pick' f x y (i, j)
+        | i < V.length x && j < V.length y = pick2 f x y
+        | i < V.length x = S.modify incI >> return (x!i)
+        | otherwise = S.modify incJ >> return (y!j)
+    pick2 f x y = do
+        (i, j) <- S.get
+        if f (x!i) (y!j) then 
+            S.modify incI >> return (x!i) 
+        else 
+            S.modify incJ >> return (y!j)
+    incI (i, j) = (i+1, j)
+    incJ (i, j) = (i, j+1)
+    n2 = n `div` 2
+    n = V.length a + V.length b
+    fpar = rpar . force
+
